@@ -1,22 +1,8 @@
 #!/usr/bin/env python
 # coding=utf-8
-# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-
-"""Finetuning 🤗 Transformers model for instance segmentation leveraging the Trainer API."""
-
 import logging
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # 显式指定使用的 GPU
 import sys
 from dataclasses import dataclass, field
 from functools import partial
@@ -130,16 +116,14 @@ def load_all_datasets(root_dir):
         "validation": combined_val,
     })
 
-
 import numpy as np
+from datasets import DatasetDict
 
 def preprocess_masks(batch):
     """
-    对掩码标签进行预处理，将背景像素值 255 转换为 ignore_index。
-    Args:
-        batch (dict): 包括 "image" 和 "annotation" 的字典。
-    Returns:
-        dict: 预处理后的数据。
+    对掩码标签进行预处理：
+    - 将背景像素值 255 保留为 ignore_index。
+    - 其他像素值以 127 为界，大于 127 的归为 1（前景类），小于等于 127 的归为 0（背景类）。
     """
     processed_batch = {
         "image": batch["image"],
@@ -147,20 +131,24 @@ def preprocess_masks(batch):
     }
     annotation = processed_batch["annotation"]
 
-    # 将背景像素值 255 替换为 PyTorch ignore_index (通常为 255)
-    annotation[annotation == 255] = 255  # 设置为 ignore_index
+    # 将背景像素值 255 保留为 ignore_index
+    annotation[annotation == 255] = 255  # 保持为 ignore_index
+    
+    # 其他像素值以 127 为界分为两类
+    annotation = np.where(annotation > 127, 1, 0)  # 大于 127 归为 1，小于等于 127 归为 0
+
     annotation = annotation.astype(np.int64)  # 转为整数类型
     processed_batch["annotation"] = annotation
     return processed_batch
 
-
-dataset = load_all_datasets("datasets/lane_labeled_expand_train_val")
+# 加载数据集
+dataset = load_all_datasets("lane_labeled_expand_train_val")
 
 # 应用预处理
-dataset = dataset.map(preprocess_masks, batched=False)
+dataset = dataset.map(preprocess_masks, batched=False, num_proc=8)
 
-
-label2id = {"background": 255, "lane": 0}
+# 定义类别映射
+label2id = {"background": 0, "lane": 1}  # 0 是背景，1 是车道
 id2label = {v: k for k, v in label2id.items()}
 
 
@@ -223,24 +211,44 @@ def augment_and_transform_batch(
         "class_labels": [],
     }
 
+    # 用于保存整个数据集的类别值
+    global_class_labels = set()
+
     for pil_image, pil_annotation in zip(examples["image"], examples["annotation"]):
+        # 确保图像和掩码格式正确
         image = np.array(pil_image)
-        semantic_and_instance_masks = np.array(pil_annotation)[..., :2]
+        semantic_and_instance_masks = np.array(pil_annotation.convert("L"))  # 转换为灰度图像
+
+        # 打印掩码的维度和形状
+        print(f"semantic_and_instance_masks 维度: {semantic_and_instance_masks.ndim}, 形状: {semantic_and_instance_masks.shape}")
+        
+        # 如果掩码维度不正确，强制转换为二维
+        if semantic_and_instance_masks.ndim == 1:
+            height, width = pil_annotation.size
+            semantic_and_instance_masks = semantic_and_instance_masks.reshape((height, width))
+
+        # 打印当前掩码的唯一类别值
+        unique_classes = np.unique(semantic_and_instance_masks)
+        print(f"当前掩码唯一类别值: {unique_classes}")
+
+        # 更新全局类别集合
+        global_class_labels.update(unique_classes)
 
         # Apply augmentations
         output = transform(image=image, mask=semantic_and_instance_masks)
 
         aug_image = output["image"]
         aug_semantic_and_instance_masks = output["mask"]
-        aug_instance_mask = aug_semantic_and_instance_masks[..., 1]
+        aug_instance_mask = aug_semantic_and_instance_masks  # 单通道掩码
 
         # Create mapping from instance id to semantic id
-        unique_semantic_id_instance_id_pairs = np.unique(aug_semantic_and_instance_masks.reshape(-1, 2), axis=0)
-        instance_id_to_semantic_id = {
-            instance_id: semantic_id for semantic_id, instance_id in unique_semantic_id_instance_id_pairs
-        }
+        unique_semantic_ids = np.unique(aug_semantic_and_instance_masks)
+        instance_id_to_semantic_id = {instance_id: instance_id for instance_id in unique_semantic_ids}
 
-        # Apply the image processor transformations: resizing, rescaling, normalization
+        # 打印图像和掩码的形状
+        print(f"图像形状: {aug_image.shape}, 掩码形状: {aug_instance_mask.shape}")
+
+        # Apply the image processor transformations
         model_inputs = image_processor(
             images=[aug_image],
             segmentation_maps=[aug_instance_mask],
@@ -251,6 +259,9 @@ def augment_and_transform_batch(
         batch["pixel_values"].append(model_inputs.pixel_values[0])
         batch["mask_labels"].append(model_inputs.mask_labels[0])
         batch["class_labels"].append(model_inputs.class_labels[0])
+    
+    # 打印全局类别值
+    print(f"数据集中所有类别值: {sorted(global_class_labels)}")
 
     return batch
 
@@ -508,6 +519,7 @@ def main():
     # ------------------------------------------------------------------------------------------------
     model = AutoModelForUniversalSegmentation.from_pretrained(
         args.model_name_or_path,
+        num_labels=2,
         label2id=label2id,
         id2label=id2label,
         ignore_mismatched_sizes=True,
@@ -531,10 +543,12 @@ def main():
             A.HorizontalFlip(p=0.5),
             A.RandomBrightnessContrast(p=0.5),
             A.HueSaturationValue(p=0.1),
+            A.Resize(height=512, width=512, always_apply=True),
         ],
     )
     validation_transform = A.Compose(
-        [A.NoOp()],
+        # [A.NoOp()],
+        A.Resize(height=512, width=512, always_apply=True),
     )
 
     # Make transform functions for batch and apply for dataset splits
@@ -544,6 +558,7 @@ def main():
     validation_transform_batch = partial(
         augment_and_transform_batch, transform=validation_transform, image_processor=image_processor
     )
+
 
     dataset["train"] = dataset["train"].with_transform(train_transform_batch)
     dataset["validation"] = dataset["validation"].with_transform(validation_transform_batch)
